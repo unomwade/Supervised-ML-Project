@@ -1,0 +1,319 @@
+---
+title: "ML Contest 3"
+author: "Marc Wade"
+date: "2023-05-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Set-up
+```{r}
+library(xgboost)
+library(dplyr)
+library(tidyr)
+library(caret)
+
+
+```
+
+
+Clean
+```{r}
+train = read.csv("train3.csv")
+test = read.csv("test3.csv")
+
+
+train$orderDate = as.Date(train$orderDate, format="%Y-%m-%d")
+train$colorCode = as.character(train$colorCode)
+train$typeCode = as.character(train$typeCode)
+train$orderID = as.integer(gsub("^.{2}",'',train$orderID))
+
+test$orderDate = as.Date(test$orderDate, format="%Y-%m-%d")
+test$colorCode = as.character(test$colorCode)
+test$typeCode = as.character(test$typeCode)
+test$orderID = as.integer(gsub("^.{2}",'',test$orderID))
+
+intToBin = function(x){
+  v = c()
+  for(i in 0:12){
+    if(x>= 2^(12-i)){
+      x = x-2^(12-i)
+      v = c(v,TRUE)}
+    else{
+      v = c(v,FALSE)
+      }}
+  v
+}
+
+getBinMatrix = function(x){t(sapply(x,intToBin))}
+
+
+
+
+```
+
+
+Exploration
+```{r}
+#unique values
+for(i in 4:14){
+  print(length(unique(train[,i])))
+}
+
+#Check for Missing Data
+colMeans(is.na(train))
+colMeans(is.na(test))
+
+#Check train return %
+mean(train$return)
+
+#Check uniformity of returns by order
+a = train %>% group_by(orderID) %>% summarise(mean = mean(return))
+hist(a[a$mean>0 & a$mean<1,]$mean,breaks = 10)
+
+
+#Check voucher distribution
+table(train$voucherID,train$return)
+mean(train[train$voucherID!="NONE",]$return)
+
+
+#Check device Code and payment Code rates
+table(train$deviceCode,train$return)/length(train$recordID)
+table(train$paymentCode,train$return)/length(train$recordID)
+
+
+#Check percentage of customers in both train and test
+length(intersect(train$customerID,test$customerID))/length(unique(test$customerID)) #34%
+cbind(table(train$customerID,train$return)/rowSums(table(train$customerID,train$return)),rowSums(table(train$customerID,train$return)))[,-1]
+
+
+#Check if same voucher code maps to different $ amounts
+colSums(table(train$voucherAmount,train$voucherID) !=0) #Yes, they do...
+
+#Check colorCode intersection
+length(intersect(test$colorCode,train$colorCode))/length(unique(test$colorCode))
+test[test$colorCode %in% intersect(test$colorCode,train$colorCode),]
+
+
+
+#Plot Dates vs total orders shows strong positive trend with potential seasonality
+#Plot # of orders with daily return rate, strong linear trend
+a = train %>% group_by(orderDate) %>% mutate(dailyOrders = n())
+a = a %>% mutate(dailyReturn = sum(return))
+df = data.frame(date = a$orderDate,orders = a$dailyOrders,dReturn = a$dailyReturn)
+df$rate = df$dReturn/df$orders
+df = df[!duplicated(df[,c('date')]),]
+
+ggplot(df,aes(x = date,y = orders)) + geom_point()
+ggplot(df,aes(x = orders,y = dReturn)) + geom_point()
+ggplot(df,aes(x = orders,y = rate)) + geom_point()
+
+summary(lm(orders~date,df))
+summary(lm(dReturn~orders,df))
+summary(lm(rate~orders,df))
+```
+
+
+Feature Engineering
+```{r}
+train$orderSize = (train %>% group_by(orderID) %>% mutate(orderSize = n()))$orderSize
+train$orderPrice = (train %>% group_by(orderID) %>% mutate(orderPrice = sum(price)))$orderPrice
+train$RorderPrice = (train %>% group_by(orderID) %>% mutate(RorderPrice = sum(recommendedPrice)))$RorderPrice
+
+a=train %>% group_by(voucherID) %>% mutate(voucherCount = n())
+train[a$voucherCount<1200,]$voucherID = "RARE"
+
+
+train = train %>% group_by(orderDate) %>% mutate(dailyOrders = n())
+train = train %>% group_by(orderDate) %>% mutate(dailyReturn = sum(return))
+train$rRate = train$dailyReturn/train$dailyOrders
+
+
+train$typeCode = as.factor(train$typeCode)
+
+#################################################################################
+
+test$orderSize = (test %>% group_by(orderID) %>% mutate(orderSize = n()))$orderSize
+test$orderPrice = (test %>% group_by(orderID) %>% mutate(orderPrice = sum(price)))$orderPrice
+test$RorderPrice = (test %>% group_by(orderID) %>% mutate(RorderPrice = sum(recommendedPrice)))$RorderPrice
+
+a=test %>% group_by(voucherID) %>% mutate(voucherCount = n())
+test[a$voucherCount<1200,]$voucherID = "RARE"
+
+
+test = test %>% group_by(orderDate) %>% mutate(dailyOrders = n()) %>% ungroup()
+test$dailyReturn = round(80.572 + .52*test$dailyOrders )
+test$rRate = test$dailyReturn/test$dailyOrders
+
+
+test$typeCode = as.factor(test$typeCode)
+levels(test$typeCode) = levels(train$typeCode)
+
+#################################################################################
+
+train = train %>% group_by(customerID) %>% mutate(cRate = mean(return)) %>% ungroup()
+
+
+traint = train[,!names(train) %in% c("return","cRate")]
+a = rbind(traint,test)
+a = a %>% group_by(customerID) %>% mutate(cRunCount = 1:n()) %>% mutate(cFreq = n()) %>% ungroup()
+a$firstOrder = as.numeric(!duplicated(a$customerID))
+a = a %>% group_by(orderID) %>% mutate(firstOrder = max(firstOrder)) %>% ungroup()
+
+
+a$itemID = as.numeric(factor(a$itemID,levels = unique(a$itemID)))
+mat = getBinMatrix(a$itemID)[,-c(1,2)]
+colnames(mat) = paste0("itemID_",1:11)
+a=cbind(a,as.data.frame(mat))
+
+a$colorCode = as.numeric(factor(a$colorCode,levels = unique(a$colorCode)))
+mat = getBinMatrix(a$colorCode)[,-c(1:4)]
+colnames(mat) = paste0("colorCode_",1:9)
+a=cbind(a,as.data.frame(mat))
+
+a$repeatOrder = duplicated(a[,c("customerID","itemID","sizeCode","colorCode")])
+a$priorOrder = duplicated(a[,c("customerID","itemID")])
+ 
+
+test = left_join(test,unique(a[,c("customerID","cFreq")]))
+test = left_join(test,unique(a[,c("recordID","cRunCount")]))
+test = left_join(test,unique(a[,c("recordID","firstOrder")]))
+test = cbind(test,a[423898:695633,24:45])
+
+
+testKnown = test[test$customerID %in% intersect(train$customerID,test$customerID),]
+testUnknown = test[!(test$customerID %in% intersect(train$customerID,test$customerID)),]
+
+testKnown = left_join(testKnown,unique(train[,c("customerID","cRate")]))
+
+
+train = train %>% group_by(customerID) %>% mutate(cRunCount = 1:n())
+train = train %>% group_by(customerID) %>% mutate(cFreq = n()) %>% ungroup()
+train$firstOrder = as.numeric(!duplicated(train$customerID))
+train = train %>% group_by(orderID) %>% mutate(firstOrder = max(firstOrder))
+train = cbind(train,a[1:423897,24:45])
+
+```
+
+
+XGB Actual Split
+```{r}
+a = c(100,120)
+b = c(6,8)
+c = c(.6,.8)
+d = c(.6,.8)
+e = c(.6,.8)
+trControl = trainControl(method = "none")
+
+
+fit = caret::train(as.factor(return)~orderDate*dailyOrders*rRate + priorOrder+cRate * cFreq * cRunCount + orderID + price * recommendedPrice * orderSize * orderPrice * RorderPrice + voucherAmount +  itemID_1+itemID_2+itemID_3+itemID_4+itemID_5+itemID_6+itemID_7+itemID_8+itemID_9+itemID_10+itemID_11 + colorCode_1+colorCode_2+colorCode_3+colorCode_4+colorCode_5+colorCode_6+colorCode_7+colorCode_8+colorCode_9+ sizeCode + typeCode + deviceCode + paymentCode, method = "xgbTree",trControl = trControl, metric = "Accuracy", tuneGrid = expand.grid(nrounds = 120,max_depth = 8, eta = .05,gamma = 8, colsample_bytree = .8, min_child_weight = .8, subsample = .8) ,data = train)
+
+predXGBK= as.integer(predict(fit,testKnown))-1
+mean(predXGBK)
+
+fit = caret::train(as.factor(return)~orderDate*dailyOrders*rRate+priorOrder + cFreq * cRunCount + orderID + price * recommendedPrice * orderSize * orderPrice * RorderPrice + voucherAmount + itemID_1+itemID_2+itemID_3+itemID_4+itemID_5+itemID_6+itemID_7+itemID_8+itemID_9+itemID_10+itemID_11 + sizeCode + typeCode + deviceCode + paymentCode, method = "xgbTree",trControl = trControl, metric = "Accuracy", tuneGrid = expand.grid(nrounds = 120,max_depth = 8, eta = .05,gamma = 8, colsample_bytree = .8, min_child_weight = .8, subsample = .8), data = train)
+
+predXGBU= as.integer(predict(fit,testUnknown))-1
+mean(predXGBK$x)
+
+predXGBK = read.csv("predXGBK.csv")
+predXGBU = read.csv("predXGBU.csv")
+predXGBK = as.integer(unlist(predXGBK))
+predXGBU = as.integer(unlist(predXGBU))
+
+s = rep(2,271736)
+sub = data.frame(423898:695633,s)
+colnames(sub) = c("recordID","return")
+name = paste0('/Users/marc/Desktop/gbmSplit.csv')
+
+
+j=k=1
+for(i in 635638:695633){
+  if(i %in% testKnown$recordID){
+    sub$return[i-423897] = predXGBK[j]
+    j=j+1
+  }
+  
+  if(i %in% testUnknown$recordID){
+    sub$return[i-423897] = predXGBU[k]
+    k=k+1
+  }
+ 
+}
+
+write.csv(sub,file = name,row.names = F)
+
+
+```
+
+
+XGB Test    12122
+```{r}
+a = c(100,120,140)
+b = c(8,10)
+c = c(.6,.8)
+d = c(.8,.9)
+e = c(.8,.9)
+
+trControl = trainControl(method = "none")
+#trControl = trainControl(method  = "cv",number  = 5)
+
+for(k in 1:length(c)){
+  for(j in 1:length(b)){
+    for(m in 1:length(e)){
+      for(l in 1:length(d)){
+        for(i in 1:length(a)){
+         fit = caret::train(as.factor(return)~orderDate*dailyOrders*rRate + priorOrder+cRate * cFreq * cRunCount + orderID + price * recommendedPrice * orderSize * orderPrice * RorderPrice + voucherAmount + itemID_1+itemID_2+itemID_3+itemID_4+itemID_5+itemID_6+itemID_7+itemID_8+itemID_9+itemID_10+itemID_11 + colorCode_1+colorCode_2+colorCode_3+colorCode_4+colorCode_5+colorCode_6+colorCode_7+colorCode_8+colorCode_9 + sizeCode + typeCode + deviceCode + paymentCode, method = "xgbTree",trControl = trControl, metric = "Accuracy", tuneGrid = expand.grid(nrounds = a[i],max_depth = 8, eta = .05,gamma = b[j], colsample_bytree = c[k], min_child_weight = d[l], subsample = e[m]) ,data = train)
+
+predXGBK= as.integer(predict(fit,testKnown))-1
+mean(predXGBK)
+
+fit = caret::train(as.factor(return)~orderDate*dailyOrders*rRate+ priorOrder + cFreq * cRunCount + orderID + price * recommendedPrice * orderSize * orderPrice * RorderPrice + voucherAmount + itemID_1+itemID_2+itemID_3+itemID_4+itemID_5+itemID_6+itemID_7+itemID_8+itemID_9+itemID_10+itemID_11 +  sizeCode + typeCode + deviceCode + paymentCode, method = "xgbTree",trControl = trControl, metric = "Accuracy", tuneGrid = expand.grid(nrounds = a[i],max_depth = 8, eta = .05,gamma = b[j], colsample_bytree = c[k], min_child_weight = d[l], subsample = e[m]) ,data = train)
+
+predXGBU= as.integer(predict(fit,testUnknown))-1
+mean(predXGBU)
+
+
+s = rep(2,271736)
+sub = data.frame(423898:695633,s)
+colnames(sub) = c("recordID","return")
+name = paste0('/Users/Marc/Desktop/gbmSplit.csv')
+
+
+p=q=1
+for(o in 423898:695633){
+  if(o %in% testKnown$recordID){
+    sub$return[o-423897] = predXGBK[p]
+    p=p+1
+  }
+  
+  if(o %in% testUnknown$recordID){
+    sub$return[o-423897] = predXGBU[q]
+    q=q+1
+  }
+ 
+}
+name = paste0('/Users/Marc/Desktop/3gbm',k,j,m,l,i,'.csv')
+write.csv(sub,file = name,row.names = F)
+        }
+      }
+    }
+  }
+}
+
+```
+
+
+Initial Model
+```{r}
+trControl = trainControl(method  = "cv",number  = 5)
+fit = caret::train(as.factor(return)~orderDate + price * recommendedPrice * orderSize * orderPrice * voucherAmount + sizeCode + typeCode  + deviceCode + paymentCode, method = "bayesglm",trControl = trControl, metric = "Accuracy", data = train)
+
+pred = predict(fit,newdata = remove_missing_levels(fit,test))
+
+```
+
+
